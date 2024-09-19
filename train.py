@@ -25,7 +25,7 @@ warnings.warn = warn
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--path', type=str, default='data', help='Raf-DB dataset path.')
+    parser.add_argument('--path', type=str, default='data', help='dataset path.')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size.')
     parser.add_argument('--lr', type=float, default=0.1, help='Initial learning rate for sgd.')
     parser.add_argument('--workers', default=0, type=int, help='Number of data loading workers.')
