@@ -214,10 +214,14 @@ def run_training():
 
             best_acc = max(acc,best_acc)
 
-
             bacc = np.around(np.mean(baccs),4)
             tqdm.write("[Epoch %d] Val acc:%.4f. auc_score:%.4f. bacc:%.4f. Loss:%.3f." % (epoch, acc,auc_score, bacc, running_loss))
             tqdm.write("best_acc:" + str(best_acc))
-
+            if acc == best_acc:
+                    torch.save({'iter': epoch,
+                                'model_state_dict': model.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),},
+                                os.path.join('estimator_checkpoints', "acc"+str(acc)+"_epoch"+str(epoch)+"_"+args.data[:-4]+".pth"))
+                    tqdm.write('Model saved.')
 if __name__ == "__main__":        
     run_training()
