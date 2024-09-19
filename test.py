@@ -1,220 +1,193 @@
-# -*- coding: utf-8 -*-
-
-from __future__ import print_function, division
-
-from PIL import Image
-from torchvision import transforms
-from torch.autograd import Variable
-from torch.utils import data
-
+import os
+import warnings
+from tqdm import tqdm
 import argparse
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.backends.cudnn as cudnn
-import numpy as np
-import time
-import os
-import scipy.io
-import yaml
-import math
-from model import ft_net, Backbone_nFC
-from utils import fuse_all_conv_bn
-from reid_dataset import import_MarketDuke_nodistractors
-from reid_dataset import import_Market1501Attribute_binary
-from reid_dataset import import_DukeMTMCAttribute_binary
-######################################################################
-# Options
-# --------
-
-parser = argparse.ArgumentParser(description='Test')
-parser.add_argument('--gpu_ids',default='0', type=str,help='gpu_ids: e.g. 0  0,1,2  0,2')
-parser.add_argument('--which_epoch',default='last', type=str, help='0,1,2,3...or last')
-parser.add_argument('--test_dir',default='../1.datasets/',type=str, help='./test_data')
-parser.add_argument('--name', default='resnet50', type=str, help='save model path')
-parser.add_argument('--batchsize', default=64, type=int, help='batchsize')
-parser.add_argument('--linear_num', default=512, type=int, help='feature dimension: 512 or default or 0 (linear=False)')
-parser.add_argument('--ms',default='1', type=str,help='multiple_scale: e.g. 1 1,1.1  1,1.1,1.2')
-
-opt = parser.parse_args()
-###load config###
-# load the training config
-config_path = os.path.join('./model',opt.name,'opts.yaml')
-with open(config_path, 'r') as stream:
-        config = yaml.load(stream, Loader=yaml.FullLoader) # for the new pyyaml via 'conda install pyyaml'
-opt.stride = config['stride']
-if 'nclasses' in config: # tp compatible with old config files
-    opt.nclasses = config['nclasses']
-else: 
-    opt.nclasses = 751 
-
-str_ids = opt.gpu_ids.split(',')
-name = opt.name
-test_dir = opt.test_dir
-
-gpu_ids = []
-for str_id in str_ids:
-    id = int(str_id)
-    if id >=0:
-        gpu_ids.append(id)
-
-print('We use the scale: %s'%opt.ms)
-str_ms = opt.ms.split(',')
-ms = []
-for s in str_ms:
-    s_f = float(s)
-    ms.append(math.sqrt(s_f))
-
-# set gpu ids
-if len(gpu_ids)>0:
-    torch.cuda.set_device(gpu_ids[0])
-    cudnn.benchmark = True
-
-######################################################################
-# Load Data
-# ---------
-
-h, w = 256, 128
-
-data_transforms = transforms.Compose([
-        transforms.Resize((h, w), interpolation=3),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
-data_dir = test_dir
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from torch.nn import init
 
 
-class Test_Dataset(data.Dataset):
-    def __init__(self, data_dir, dataset_name, transforms=None, query_gallery='all' ):
-        train, query, gallery = import_MarketDuke_nodistractors(data_dir, dataset_name)
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
-        if dataset_name == 'Market-1501':
-            self.train_attr, self.test_attr, self.label = import_Market1501Attribute_binary(data_dir)
-        elif dataset_name == 'DukeMTMC-reID':
-            self.train_attr, self.test_attr, self.label = import_DukeMTMCAttribute_binary(data_dir)
-        else:
-            print('Input should only be Market1501 or DukeMTMC')
+def warn(*args, **kwargs):
+    pass
+warnings.warn = warn
 
-        if query_gallery == 'query':
-            self.test_data = query['data']
-            self.test_ids = query['ids']
-        elif query_gallery == 'gallery':
-            self.test_data = gallery['data']
-            self.test_ids = gallery['ids']
-        elif query_gallery == 'all':
-            self.test_data = gallery['data'] + query['data']
-            self.test_ids = gallery['ids']
-        else:
-            print('Input shoud only be query or gallery;')
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--path', type=str, default='data', help='dataset path.')
+    parser.add_argument('--data', type=str, default='QRA_metricfgsm.txt')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size.')
+    parser.add_argument('--lr', type=float, default=0.01, help='Initial learning rate for sgd.')
+    parser.add_argument('--workers', default=0, type=int, help='Number of data loading workers.')
+    parser.add_argument('--epochs', type=int, default=50, help='Total training epochs.')
+    parser.add_argument('--input_dim', type=int, default=57)
 
-        self.transforms = transforms
+    return parser.parse_args()
 
-    def __getitem__(self, index):
-        img_path = self.test_data[index][0]
-        id = self.test_data[index][2]
-        label = np.asarray(self.test_attr[id])
-        data = Image.open(img_path)
-        data = self.transforms(data)
-        name = self.test_data[index][4]
-        return data, label, id, name
+def weights_init_kaiming(m):
+    classname = m.__class__.__name__
+    # print(classname)
+    if classname.find('Conv') != -1:
+        init.kaiming_normal_(m.weight.data, a=0, mode='fan_in') # For old pytorch, you may use kaiming_normal.
+    elif classname.find('Linear') != -1:
+        init.kaiming_normal_(m.weight.data, a=0, mode='fan_out')
+        init.constant_(m.bias.data, 0.0)
+    elif classname.find('BatchNorm1d') != -1:
+        init.normal_(m.weight.data, 1.0, 0.02)
+        init.constant_(m.bias.data, 0.0)
+
+def weights_init_classifier(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        init.normal_(m.weight.data, std=0.001)
+        init.constant_(m.bias.data, 0.0)
+
+class ADDataSet(Dataset):
+    def __init__(self, path='data', file=''):
+        self.path = path
+        self.file = file
+
+        df = pd.read_csv(os.path.join(self.path, self.file), sep='\t', header=None,names=['QRA','label'])
+
+        selected_columns = df[['QRA']]
+
+        self.data = selected_columns.apply(lambda row: [float(value) for value in row.values[0].split()], axis=1).tolist()
+        
+        self.label = df[['label']].values
+
+        _, self.sample_counts = np.unique(self.label, return_counts=True)
+        print(f' distribution of samples: {self.sample_counts}')
 
     def __len__(self):
-        return len(self.test_data)
-
-    def labels(self):
-        return self.labels
-
-
-
-image_datasets = {x: Test_Dataset(data_dir, dataset_name='Market-1501',transforms=data_transforms, query_gallery=x) for x in ['gallery','query']}
-
-dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=opt.batchsize,
-                                            shuffle=False, num_workers=0) for x in ['gallery','query']}
-
-
-
-######################################################################
-# Load model
-#---------------------------
-def load_network(ReIDnetwork):
-    ReID_save_path = os.path.join('./model',name,'ReID_net_%s.pth'%opt.which_epoch)
-    ReIDnetwork.load_state_dict(torch.load(ReID_save_path))
-    return ReIDnetwork
-
-######################################################################
-# Extract feature
-# ----------------------
-def fliplr(img):
-    '''flip horizontal'''
-    inv_idx = torch.arange(img.size(3)-1,-1,-1).long()  # N x C x H x W
-    img_flip = img.index_select(3,inv_idx)
-    return img_flip
-
-def extract_feature(model,dataloaders):
-    #features = torch.FloatTensor()
-    count = 0
-    if opt.linear_num <= 0:
-        opt.linear_num = 2048
-    camera_id = []
-    labels = []
-    for iter, data in enumerate(dataloaders):
-
-        img, label, ids, name = data
-        for id in ids:
-            labels.append(int(id))
-
-        for cn in name:
-            camera = cn.split('c')[1]   
-            camera_id.append(int(camera[0]))
-        
-        n, c, h, w = img.size()
-        count += n
-        ff = torch.FloatTensor(n,opt.linear_num).zero_().cuda()
-
-        for i in range(2):
-            if(i==1):
-                img = fliplr(img)
-            input_img = Variable(img.cuda())
-            for scale in ms:
-                if scale != 1:
-                    input_img = nn.functional.interpolate(input_img, scale_factor=scale, mode='bicubic', align_corners=False)
-                outputs = model(input_img)
-                ff += outputs
-        # norm feature
-        fnorm = torch.norm(ff, p=2, dim=1, keepdim=True)
-        ff = ff.div(fnorm.expand_as(ff))
-        
-        if iter == 0:
-            features = torch.FloatTensor( len(dataloaders.dataset), ff.shape[1])
-        start = iter*opt.batchsize
-        end = min( (iter+1)*opt.batchsize, len(dataloaders.dataset))
-        features[ start:end, :] = ff
-    return features, camera_id, labels
-
-# Load Collected data Trained model
-print('-------Load ReID model-----------')
-ReID_model_structure= ft_net(opt.nclasses, stride = opt.stride, ibn = False, linear_num=opt.linear_num)
-
-ReIDmodel = load_network(ReID_model_structure)
-ReIDmodel.classifier.classifier = nn.Sequential()
-
-# Change to test mode
-ReIDmodel = ReIDmodel.eval()
-
-if torch.cuda.is_available():
-    ReIDmodel = ReIDmodel.cuda()
-
-model = fuse_all_conv_bn(ReIDmodel)
-
-# Extract feature
-since = time.time()
-with torch.no_grad():
-    gallery_feature, gallery_cam, gallery_label = extract_feature(model,dataloaders['gallery'])
-    query_feature, query_cam, query_label = extract_feature(model,dataloaders['query'])
+        return sum(self.sample_counts)
     
-time_elapsed = time.time() - since
-print('Training complete in {:.0f}m {:.2f}s'.format(
-            time_elapsed // 60, time_elapsed % 60))
-# Save to Matlab for check
-result = {'gallery_f':gallery_feature.numpy(),'gallery_label':gallery_label,'gallery_cam':gallery_cam, 'query_f_adv':query_feature.numpy(), 'query_label':query_label, 'query_cam':query_cam}
-scipy.io.savemat('%s_adv.mat'%name,result)
+    def get_labels(self):
+        return self.label
+    
+    def __getitem__(self, idx):
+        data = self.data[idx]
+        new_data = data.copy()
+        new_data.append(np.std(data[:10]))
+        new_data.append(np.std(data[10:]))
+        new_data = torch.tensor(new_data, dtype=torch.float32)
+        label = self.label[idx].astype(np.float32)
+        
+        return new_data, label[0]
+
+class MLP(nn.Module):
+    def __init__(self,input_dim=57,class_num=1,num_bottleneck=256,droprate=0.5):
+        super(MLP,self).__init__()
+        self.input_dim = input_dim
+        self.fc1 = nn.Linear(input_dim, num_bottleneck).apply(weights_init_kaiming)
+        self.bn1 = nn.BatchNorm1d(num_bottleneck).apply(weights_init_kaiming)
+        self.relu = nn.LeakyReLU(0.1).apply(weights_init_kaiming)
+        self.fc3 = nn.Linear(num_bottleneck, num_bottleneck).apply(weights_init_kaiming)
+        self.bn3 = nn.BatchNorm1d(num_bottleneck).apply(weights_init_kaiming)
+        self.relu3 = nn.LeakyReLU(0.1).apply(weights_init_kaiming)
+        self.fc2 = nn.Linear(num_bottleneck, class_num).apply(weights_init_classifier)        
+
+    def forward(self,x):
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.fc3(x)
+        x = self.bn3(x)
+        x = self.relu3(x)        
+        x = self.fc2(x)
+        return x
+    
+
+class AverageMeter:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, num):
+        self.val = val
+        self.sum += val * num
+        self.count += num
+        self.avg = self.sum / self.count
+
+def run_validation():
+    args = parse_args()
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.enabled = True
+        
+    model = MLP(input_dim=args.input_dim).to(device)
+
+    val_dataset = ADDataSet(args.path, args.data)    
+
+    print(f"Validation Data Size : {len(val_dataset)}")
+
+    val_loader = DataLoader(val_dataset,
+                            batch_size = args.batch_size,
+                            num_workers = args.workers,
+                            shuffle = False,  
+                            pin_memory = True)
+    checkpoint = torch.load('./weights/QuEst_pretrained.pth')
+    model.load_state_dict(checkpoint['model_state_dict'],strict=True)
+    model.to(device)
+    criterion_mae = torch.nn.L1Loss().to(device)
+    params = list(model.parameters())
+    optimizer = torch.optim.SGD(params,lr=args.lr, weight_decay = 1e-4, momentum=0.9)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+
+    loss_meter = AverageMeter()
+    error_meter = AverageMeter()
+
+    best_err = 100
+
+    with torch.no_grad():
+        with open('QRA_metricfgsm.txt','a') as f:
+            all_targets = []
+            all_predicts = []
+            sample_cnt = 0
+            bingo_cnt = 0
+
+
+            model.eval()
+            for (data, targets, index) in val_loader:
+                data = data.to(device)
+                targets = targets.to(device)
+                out = model(data)
+
+                loss = criterion_mae(out,targets)
+                error = criterion_mae(out,targets)
+
+                predicts = out.to(torch.int)
+
+                all_targets.append(targets[0].cpu().detach().numpy())
+                all_predicts.append(predicts[0].cpu().detach().numpy())
+                
+                pred = torch.where(predicts.cpu())
+
+                correct_num  = torch.eq(pred,targets.cpu())
+                bingo_cnt += correct_num.sum().cpu()
+                sample_cnt += out.size(0)
+                num = data.size(0)
+                loss_meter.update(loss.item(), num)
+                error_meter.update(error.item(), num)
+
+            acc = bingo_cnt.float()/float(sample_cnt)
+            acc = np.around(acc.numpy(),4)
+            scheduler.step()
+            best_err = min(error_meter.val,best_err)
+            tqdm.write('Val: Error: %.4f. Loss: %.3f. Acc: %.4f' % (error_meter.avg, loss_meter.avg, acc))
+        
+if __name__ == "__main__":        
+    run_validation()

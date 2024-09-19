@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size.')
     parser.add_argument('--lr', type=float, default=0.1, help='Initial learning rate for sgd.')
     parser.add_argument('--workers', default=0, type=int, help='Number of data loading workers.')
-    parser.add_argument('--epochs', type=int, default=30, help='Total training epochs.')
+    parser.add_argument('--epochs', type=int, default=50, help='Total training epochs.')
     parser.add_argument('--data', type=str, default='QRA_metricfgsm.txt')
     parser.add_argument('--input_dim', type=int, default=57)
 
@@ -214,14 +214,10 @@ def run_training():
 
             best_acc = max(acc,best_acc)
 
+
             bacc = np.around(np.mean(baccs),4)
             tqdm.write("[Epoch %d] Val acc:%.4f. auc_score:%.4f. bacc:%.4f. Loss:%.3f." % (epoch, acc,auc_score, bacc, running_loss))
             tqdm.write("best_acc:" + str(best_acc))
-            if acc == best_acc:
-                    torch.save({'iter': epoch,
-                                'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),},
-                                os.path.join('estimator_checkpoints', "acc"+str(acc)+"_epoch"+str(epoch)+"_"+args.data[:-4]+".pth"))
-                    tqdm.write('Model saved.')
+
 if __name__ == "__main__":        
     run_training()
